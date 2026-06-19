@@ -1,0 +1,47 @@
+/*
+ * Launcher (cpuapp) side of the FLPR memory enlargement.
+ *
+ * The auto-added vpr_launcher image (samples/basic/minimal + nordic-flpr
+ * snippet) is what loads the FLPR image from RRAM into SRAM and starts the VPR.
+ * Its view of the FLPR regions MUST match boards/nrf54lm20dk_nrf54lm20a_cpuflpr.overlay,
+ * otherwise the VPR is started at the wrong address and hangs.
+ *
+ * Map (nRF54LM20A: 512 KB SRAM, 2036 KB RRAM):
+ *   FLPR exec SRAM : 0x20040000 .. 0x2007fc00  (255 KB)   <- cpuflpr_sram_code_data
+ *   cpuapp SRAM    : 0x20000000 .. 0x20040000  (256 KB)
+ *   FLPR code RRAM : 0x1bd000   .. 0x1fd000    (256 KB)   <- cpuflpr_code_partition
+ *   cpuapp RRAM    : 0x0        .. 0x1bd000    (1780 KB)
+ */
+
+/* FLPR execution SRAM (where the launcher copies the image and starts the VPR) */
+&cpuflpr_sram_code_data {
+	reg = <0x20040000 DT_SIZE_K(255)>;
+	ranges = <0x0 0x20040000 DT_SIZE_K(255)>;
+};
+
+
+/* Shrink cpuapp SRAM so it does not overlap the enlarged FLPR region */
+&cpuapp_sram {
+	reg = <0x20000000 DT_SIZE_K(256)>;
+	ranges = <0x0 0x20000000 DT_SIZE_K(256)>;
+};
+
+/* FLPR code source partition (RRAM) the launcher reads the image from */
+&cpuflpr_code_partition {
+	reg = <0x1bd000 DT_SIZE_K(256)>;
+};
+
+/* Shrink cpuapp RRAM and drop the unused second slot / storage so the cpuapp
+ * partitions fit below the enlarged FLPR code region.
+ */
+/delete-node/ &slot1_partition;
+/delete-node/ &storage_partition;
+
+&slot0_partition {
+	reg = <0x10000 0x1ad000>;   /* 0x10000 .. 0x1bd000 */
+};
+
+&cpuapp_rram {
+	reg = <0x0 DT_SIZE_K(1780)>;
+	ranges = <0x0 0x0 DT_SIZE_K(1780)>;
+};

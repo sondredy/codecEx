@@ -1,0 +1,33 @@
+/*
+ * FLPR (VPR) memory enlargement for the LC3 codec.
+ *
+ * The FLPR runs with CONFIG_XIP disabled: it is loaded from RRAM into SRAM by
+ * the application core and executes everything (code, rodata, data, bss, stack)
+ * from SRAM. The default split gives the FLPR only 96 KB of SRAM and a 96 KB
+ * RRAM code partition, but liblc3 needs ~150 KB SRAM and ~122 KB of stored
+ * image. We grow both regions; this MUST be kept consistent with the launcher
+ * (see sysbuild/vpr_launcher.overlay).
+ *
+ * Map (nRF54LM20A: 512 KB SRAM, 2036 KB RRAM):
+ *   FLPR exec SRAM : 0x20040000 .. 0x2007fc00  (255 KB)
+ *   FLPR code RRAM : 0x1bd000   .. 0x1fd000    (256 KB)
+ *
+ * The RRAM (source) must be >= the SRAM (execution) region: the launcher copies
+ * execution-size bytes out of the source partition before starting the VPR.
+ */
+
+/* Execution SRAM */
+&cpuflpr_sram {
+	reg = <0x20040000 DT_SIZE_K(255)>;
+	ranges = <0x0 0x20040000 DT_SIZE_K(255)>;
+};
+
+/* RRAM region the image is stored in / loaded from */
+&cpuflpr_rram {
+	reg = <0x1bd000 DT_SIZE_K(256)>;
+	ranges = <0x0 0x1bd000 DT_SIZE_K(256)>;
+};
+
+&cpuflpr_code_partition {
+	reg = <0x0 DT_SIZE_K(256)>;
+};

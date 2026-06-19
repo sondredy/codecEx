@@ -5,22 +5,41 @@
  */
 
 #include <stdio.h>
-#include <zephyr/device.h>
+#include <string.h>
 #include <zephyr/kernel.h>
-#include <zephyr/devicetree.h>
-#include <zephyr/audio/codec.h>
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(codec_sample);
 
-#define AUDIO_BLOCK_SIZE 320
-#define SPEAKER_VOL      15
+#include <lc3.h>
 
-static bool loopback;
-static uint8_t *audio_data_p;
+LOG_MODULE_REGISTER(lc3_check);
 
-/* PCM data is word-aligned for efficient access (e.g. by the codec/DMA).
+/* LC3 stream parameters */
+#define LC3_DT_US          10000   /* frame duration: 10 ms */
+#define LC3_SR_HZ          16000   /* sample rate */
+#define LC3_BITRATE_BPS    32000   /* target bitrate (mono) */
+
+/* 10 ms frame at 16 kHz mono = 160 samples (S16 => 320 bytes PCM). */
+#define LC3_NUM_SAMPLES    160
+
+/* Input PCM, one frame of S16 mono. The bundled sample is shorter than a
+ * frame, so the tail is zero-padded; that is fine for a codec sanity check.
  */
-static uint8_t __aligned(4) pcm_16k[] = {
+static int16_t pcm_in[LC3_NUM_SAMPLES];
+
+/* Decoded PCM output. */
+static int16_t pcm_out[LC3_NUM_SAMPLES];
+
+/* LC3 bitstream buffer. A 10 ms / 32 kbps frame is 40 bytes; 64 is ample. */
+static uint8_t lc3_buf[64];
+
+/* Caller-allocated codec contexts (static, no heap). The *_16k_t types cover
+ * any frame duration up to a 16 kHz sample rate.
+ */
+static lc3_encoder_mem_16k_t enc_mem;
+static lc3_decoder_mem_16k_t dec_mem;
+
+/* PCM sample (S16 LE), reused from the original codec sample. */
+static const uint8_t pcm_sample[] = {
 	0x01, 0x00, 0xFE, 0x17, 0x55, 0x2C, 0xEB, 0x39, 0xB1, 0x3E, 0xEC, 0x39, 0x55, 0x2C, 0xFE,
 	0x17, 0x01, 0x00, 0x02, 0xE8, 0xAC, 0xD3, 0x15, 0xC6, 0x4F, 0xC1, 0x15, 0xC6, 0xAC, 0xD3,
 	0x03, 0xE8, 0x00, 0x00, 0xFD, 0x17, 0x54, 0x2C, 0xEB, 0x39, 0xB1, 0x3E, 0xEC, 0x39, 0x54,
@@ -45,96 +64,62 @@ static uint8_t __aligned(4) pcm_16k[] = {
 	0xC6, 0xAB, 0xD3, 0x03, 0xE8,
 };
 
-static void tx_done(const struct device *dev, void *user_data)
-{
-	if (!loopback) {
-		size_t offset = (size_t)(audio_data_p - pcm_16k);
-		size_t remaining = sizeof(pcm_16k) - offset;
-
-		if (remaining < AUDIO_BLOCK_SIZE) {
-			audio_data_p = pcm_16k;
-		}
-		audio_codec_write(dev, audio_data_p, AUDIO_BLOCK_SIZE);
-		audio_data_p += AUDIO_BLOCK_SIZE;
-	}
-}
-static void rx_done(const struct device *dev, uint8_t *buf, uint32_t len, void *user_data)
-{
-	if (loopback) {
-		audio_codec_write(dev, buf, AUDIO_BLOCK_SIZE);
-	}
-}
-
 int main(void)
 {
-	static const struct device *dev;
-	audio_property_value_t val;
-	struct audio_codec_cfg cfg = {
-		.dai_type = AUDIO_DAI_TYPE_PCM,
-		.dai_cfg.pcm.dir = AUDIO_DAI_DIR_TX,
-		.dai_cfg.pcm.pcm_width = AUDIO_PCM_WIDTH_16_BITS,
-		.dai_cfg.pcm.channels = 1,
-		.dai_cfg.pcm.block_size = AUDIO_BLOCK_SIZE,
-		.dai_cfg.pcm.samplerate = AUDIO_PCM_RATE_16K,
-	};
+	lc3_encoder_t enc;
+	lc3_decoder_t dec;
+	int nbytes;
+	int ret;
 
-	LOG_INF("Audio codec sample");
-#if DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(codec0))
-	dev = DEVICE_DT_GET(DT_ALIAS(codec0));
-#else
-	LOG_ERR("No audio codec on this board. Skipping audio test.\n");
-	return 0;
-#endif
-	if (!device_is_ready(dev)) {
-		LOG_ERR("codec device is not ready\n");
-		return -EBUSY;
-	}
-	LOG_INF("codec device is ready");
-	k_sleep(K_MSEC(1000));
+	uint64_t time_stamp;
+	int64_t delta_time;
 
-	LOG_INF("codec playback example");
-	loopback = false;
-	audio_data_p = pcm_16k;
-	if (audio_codec_configure(dev, &cfg) < 0) {
-		LOG_ERR("configure codec error\n");
-		return -EIO;
-	}
-	if (audio_codec_register_done_callback(dev, tx_done, NULL, rx_done, NULL) < 0) {
-		LOG_ERR("could not register codec callbacks\n");
-		return -EIO;
-	}
-	audio_codec_start(dev, AUDIO_DAI_DIR_TX);
-	LOG_INF("playback started");
-	val.vol = SPEAKER_VOL;
-	if (audio_codec_set_property(dev, AUDIO_PROPERTY_OUTPUT_VOLUME, 0, val) < 0) {
-		LOG_ERR("could not set volume\n");
-		return -EIO;
-	}
-	k_sleep(K_MSEC(15000));
-	audio_codec_stop(dev, AUDIO_DAI_DIR_TX);
-	LOG_INF("codec transfer stopped");
+	LOG_INF("LC3 software codec check (liblc3 / lc3.h)");
+	LOG_INF("running on arch: %s", CONFIG_ARCH);
 
-	LOG_INF("codec loopback example");
-	loopback = true;
-	cfg.dai_cfg.pcm.dir = AUDIO_DAI_DIR_TXRX;
-	if (audio_codec_configure(dev, &cfg) < 0) {
-		LOG_ERR("configure codec error\n");
-		return -EIO;
-	}
-	if (audio_codec_register_done_callback(dev, tx_done, NULL, rx_done, NULL) < 0) {
-		LOG_ERR("could not register codec callbacks\n");
-		return -EIO;
-	}
-	audio_codec_start(dev, AUDIO_DAI_DIR_TXRX);
-	LOG_INF("loopback started");
-	if (audio_codec_set_property(dev, AUDIO_PROPERTY_OUTPUT_VOLUME, 0, val) < 0) {
-		LOG_ERR("could not set volume\n");
-		return -EIO;
-	}
-	k_sleep(K_MSEC(15000));
-	audio_codec_stop(dev, AUDIO_DAI_DIR_TXRX);
-	LOG_INF("loopback stopped");
+	/* Load one frame of PCM from the bundled sample (zero-pad the tail). */
+	memset(pcm_in, 0, sizeof(pcm_in));
+	memcpy(pcm_in, pcm_sample, MIN(sizeof(pcm_sample), sizeof(pcm_in)));
 
-	LOG_INF("Exiting");
+	/* Frame size in bytes for the chosen bitrate. */
+	nbytes = lc3_frame_bytes(LC3_DT_US, LC3_BITRATE_BPS);
+	if (nbytes < 0 || (size_t)nbytes > sizeof(lc3_buf)) {
+		LOG_ERR("bad frame size: %d", nbytes);
+		return -EINVAL;
+	}
+	LOG_INF("frame: %d samples -> %d LC3 bytes", LC3_NUM_SAMPLES, nbytes);
+
+	/* Set up encoder/decoder in caller-provided static memory. */
+	enc = lc3_setup_encoder(LC3_DT_US, LC3_SR_HZ, 0 /* no resample */, &enc_mem);
+	dec = lc3_setup_decoder(LC3_DT_US, LC3_SR_HZ, 0 /* no resample */, &dec_mem);
+	if (enc == NULL || dec == NULL) {
+		LOG_ERR("setup failed (enc=%p dec=%p)", (void *)enc, (void *)dec);
+		return -EINVAL;
+	}
+
+	/* Encode one frame: PCM (S16) -> LC3. */
+	time_stamp = k_uptime_get();
+	ret = lc3_encode(enc, LC3_PCM_FORMAT_S16, pcm_in, 1 /* stride */, nbytes, lc3_buf);
+	if (ret != 0) {
+		LOG_ERR("lc3_encode failed (%d)", ret);
+		return -EIO;
+	}
+	delta_time = k_uptime_delta(&time_stamp);
+	LOG_INF("encoded %u PCM bytes -> %d LC3 bytes in %dms.", (unsigned)sizeof(pcm_in), nbytes, delta_time);
+
+
+	/* Decode it back: LC3 -> PCM (S16). Returns 0, or 1 if PLC kicked in. */
+	time_stamp = k_uptime_get();
+	ret = lc3_decode(dec, lc3_buf, nbytes, LC3_PCM_FORMAT_S16, pcm_out, 1 /* stride */);
+	if (ret < 0) {
+		LOG_ERR("lc3_decode failed (%d)", ret);
+		return -EIO;
+	}
+	delta_time = k_uptime_delta(&time_stamp);
+	LOG_INF("decoded %d LC3 bytes -> %u PCM bytes%s in %dms.", nbytes, (unsigned)sizeof(pcm_out),
+		ret == 1 ? " (PLC applied)" : "", delta_time);
+
+	LOG_INF("LC3 roundtrip OK. Codec runs on this (%s) core.", CONFIG_ARCH);
+	LOG_INF("Done");
 	return 0;
 }
